@@ -28,7 +28,7 @@ typedef enum {
 } playback_state_t;
 
 typedef struct {
-    char name[64];
+    char name[256];
     char device_id[64];
     bool is_bluetooth;
     bool is_available;
@@ -79,6 +79,7 @@ void menu_handle_button(menu_system_t *menu, button_event_t event);
 void menu_update_display(menu_system_t *menu);
 void menu_update_playback_info(menu_system_t *menu);
 void menu_cleanup(menu_system_t *menu);
+void menu_update_playback_info(menu_system_t *menu);
 
 // Device management functions
 int menu_scan_audio_devices(menu_system_t *menu);

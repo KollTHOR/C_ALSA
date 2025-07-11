@@ -5,6 +5,8 @@
 #include <unistd.h>
 #include <wiringPi.h>
 
+#define DEBOUNCE_DELAY 50000
+
 int button_init(button_manager_t *manager, int play_pin, int prev_pin, int next_pin) {
     memset(manager, 0, sizeof(button_manager_t));
     
@@ -52,15 +54,15 @@ button_event_t button_poll(button_manager_t *manager) {
     // Buttons are active low with pull-up resistors
     if (manager->play_last_state == 1 && play_current == 0) {
         event = BUTTON_PLAY_PAUSE;
-        usleep(50000); // Debounce delay
+        usleep(DEBOUNCE_DELAY); // Debounce delay
     }
     else if (manager->prev_last_state == 1 && prev_current == 0) {
         event = BUTTON_PREV;
-        usleep(50000); // Debounce delay
+        usleep(DEBOUNCE_DELAY); // Debounce delay
     }
     else if (manager->next_last_state == 1 && next_current == 0) {
         event = BUTTON_NEXT;
-        usleep(50000); // Debounce delay
+        usleep(DEBOUNCE_DELAY); // Debounce delay
     }
     
     // Update last states
