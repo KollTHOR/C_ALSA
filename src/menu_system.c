@@ -79,12 +79,18 @@ int menu_scan_audio_devices(menu_system_t *menu) {
 
 
 static void scan_bluetooth_audio_devices(menu_system_t *menu) {
-    printf("Scanning for Bluetooth audio devices...\n");
+    printf("🔍 Scanning for BlueALSA audio devices...\n");
     
-    // Parse bluealsa-aplay -l output
+    // Check if BlueALSA service is running
+    if (system("pgrep bluealsa > /dev/null 2>&1") != 0) {
+        printf("❌ BlueALSA service not running\n");
+        return;
+    }
+    
+    // Use bluealsa-aplay to list available devices
     FILE *fp = popen("bluealsa-aplay -l 2>/dev/null", "r");
     if (!fp) {
-        printf("Failed to run bluealsa-aplay\n");
+        printf("❌ Failed to run bluealsa-aplay\n");
         return;
     }
     
@@ -111,22 +117,17 @@ static void scan_bluetooth_audio_devices(menu_system_t *menu) {
         if (strncmp(line, "hci", 3) == 0) {
             char hci[16], mac[18], mac_brackets[32], device_name[128];
             
-            // Parse the line format: "hci0: MAC [MAC-FORMAT], device name"
             if (sscanf(line, "%15[^:]: %17s [%31[^]]], %127[^\n]", 
                       hci, mac, mac_brackets, device_name) == 4) {
                 
-                printf("Found BlueALSA device: %s (%s)\n", device_name, mac);
+                printf("✅ Found BlueALSA device: %s (%s)\n", device_name, mac);
                 
-                // Truncate name if too long and add BT prefix
-                char truncated_name[60];
-                strncpy(truncated_name, device_name, sizeof(truncated_name) - 1);
-                truncated_name[sizeof(truncated_name) - 1] = '\0';
-                
+                // Add to audio device list with proper BlueALSA device string
                 snprintf(menu->audio_devices[menu->num_audio_devices].name, 
                         sizeof(menu->audio_devices[menu->num_audio_devices].name),
-                        "BT: %s", truncated_name);
+                        "BT: %s", device_name);
                 
-                // Create BlueALSA device string
+                // Create proper BlueALSA device string
                 snprintf(menu->audio_devices[menu->num_audio_devices].device_id,
                         sizeof(menu->audio_devices[menu->num_audio_devices].device_id),
                         "bluealsa:DEV=%s,PROFILE=a2dp", mac);
@@ -135,14 +136,17 @@ static void scan_bluetooth_audio_devices(menu_system_t *menu) {
                 menu->audio_devices[menu->num_audio_devices].is_available = true;
                 menu->num_audio_devices++;
                 
-                printf("Added to audio device list: BT: %s\n", truncated_name);
+                printf("📱 Added BlueALSA device: %s\n", 
+                       menu->audio_devices[menu->num_audio_devices-1].device_id);
             }
         }
     }
     pclose(fp);
     
-    printf("Bluetooth audio scan complete. Total devices: %d\n", menu->num_audio_devices);
+    printf("🔍 BlueALSA scan complete. Found %d devices\n", 
+           menu->num_audio_devices - 2); // Subtract wired devices
 }
+
 
 
 
@@ -198,33 +202,46 @@ static void menu_display_main(menu_system_t *menu) {
     lcd_print(menu->lcd, 1, 0, line2);
 }
 
+// KEEP THIS VERSION (around line 663):
 static void menu_display_playback(menu_system_t *menu) {
     lcd_clear(menu->lcd);
     
     char line1[32];
-    if (menu->cd_player->disc_present) {
-        snprintf(line1, sizeof(line1), "Track %02d/%02d", 
+    if (menu->cd_player->disc_present && menu->cd_player->is_audio_cd) {
+        char device_indicator = menu->use_bluetooth ? 'B' : 'W';
+        snprintf(line1, sizeof(line1), "%c Track %02d/%02d", device_indicator,
                 menu->current_track, menu->cd_player->num_tracks);
     } else {
         strcpy(line1, "No Disc");
     }
     lcd_print(menu->lcd, 0, 0, line1);
     
+    // Enhanced timing display
     char line2[32];
-    if (menu->playback_state == PLAYBACK_PLAYING) {
-        int minutes = menu->elapsed_time / 60;
-        int seconds = menu->elapsed_time % 60;
-        int total_min = menu->track_length / 60;
-        int total_sec = menu->track_length % 60;
-        snprintf(line2, sizeof(line2), "%02d:%02d/%02d:%02d", 
-                minutes, seconds, total_min, total_sec);
-    } else if (menu->playback_state == PLAYBACK_PAUSED) {
-        strcpy(line2, "PAUSED");
+    if (menu->playback_state == PLAYBACK_PLAYING || menu->playback_state == PLAYBACK_PAUSED) {
+        int elapsed, total;
+        if (audio_get_position(menu->audio_player, &elapsed, &total) == 0) {
+            int elapsed_min = elapsed / 60;
+            int elapsed_sec = elapsed % 60;
+            int total_min = total / 60;
+            int total_sec = total % 60;
+            
+            snprintf(line2, sizeof(line2), "%02d:%02d/%02d:%02d", 
+                    elapsed_min, elapsed_sec, total_min, total_sec);
+            
+            if (menu->playback_state == PLAYBACK_PAUSED) {
+                strcat(line2, " ||");
+            }
+        } else {
+            strcpy(line2, "00:00/00:00");
+        }
     } else {
         strcpy(line2, "STOPPED");
     }
     lcd_print(menu->lcd, 1, 0, line2);
 }
+
+
 
 static void menu_display_audio_output(menu_system_t *menu) {
     lcd_clear(menu->lcd);
@@ -317,35 +334,32 @@ static void menu_handle_bt_device_list(menu_system_t *menu, button_event_t event
             
         case BUTTON_PLAY_PAUSE:
             if (menu->menu_selection < menu->num_bt_devices) {
-                // Handle device selection (existing code)
+                // Handle device selection
                 bt_device_info_t *device = &menu->bt_devices[menu->menu_selection];
                 
                 if (device->is_connected) {
-                    // Disconnect using bluetoothctl
-                    char cmd[128];
-                    snprintf(cmd, sizeof(cmd), "bluetoothctl disconnect %s", device->address);
-                    if (system(cmd) == 0) {
+                    // Disconnect using D-Bus API
+                    if (bluetooth_disconnect_device(menu->bluetooth_manager) == 0) {
                         device->is_connected = false;
                         menu_scan_audio_devices(menu);
                         lcd_print(menu->lcd, 1, 0, "Disconnected");
+                    } else {
+                        lcd_print(menu->lcd, 1, 0, "Disconnect Failed");
                     }
                 } else if (device->is_paired) {
-                    // Connect using bluetoothctl
-                    char cmd[128];
-                    snprintf(cmd, sizeof(cmd), "bluetoothctl connect %s", device->address);
-                    if (system(cmd) == 0) {
+                    // Connect using D-Bus API
+                    lcd_print(menu->lcd, 1, 0, "Connecting...");
+                    if (bluetooth_connect_device(menu->bluetooth_manager, device->address) == 0) {
                         device->is_connected = true;
                         menu_scan_audio_devices(menu);
-                        lcd_print(menu->lcd, 1, 0, "Connected");
+                        lcd_print(menu->lcd, 1, 0, "Connected!");
                     } else {
                         lcd_print(menu->lcd, 1, 0, "Connect Failed");
                     }
                 } else {
-                    // Pair using bluetoothctl
+                    // Pair using D-Bus API
                     lcd_print(menu->lcd, 1, 0, "Pairing...");
-                    char cmd[128];
-                    snprintf(cmd, sizeof(cmd), "bluetoothctl pair %s", device->address);
-                    if (system(cmd) == 0) {
+                    if (bluetooth_pair_device(menu->bluetooth_manager, device->address) == 0) {
                         device->is_paired = true;
                         lcd_print(menu->lcd, 1, 0, "Paired");
                     } else {
@@ -364,10 +378,15 @@ static void menu_handle_bt_device_list(menu_system_t *menu, button_event_t event
             }
             break;
             
+        case BUTTON_NONE:
+            // Do nothing for no button press
+            break;
+            
         default:
             break;
     }
 }
+
 
 
 static void menu_display_cd_info(menu_system_t *menu) {
@@ -376,7 +395,11 @@ static void menu_display_cd_info(menu_system_t *menu) {
     
     char line2[32];
     if (menu->cd_player->disc_present) {
-        snprintf(line2, sizeof(line2), "%d tracks", menu->cd_player->num_tracks);
+        if (menu->cd_player->is_audio_cd) {
+            snprintf(line2, sizeof(line2), "%d audio tracks", menu->cd_player->num_tracks);
+        } else {
+            strcpy(line2, "Not audio CD");
+        }
     } else {
         strcpy(line2, "No disc");
     }
@@ -424,11 +447,36 @@ static void menu_handle_main_menu(menu_system_t *menu, button_event_t event) {
         case BUTTON_PLAY_PAUSE:
             switch (menu->menu_selection) {
                 case 0: // Play CD
-                    if (menu->cd_player->disc_present) {
+                    cd_detect_disc(menu->cd_player);
+                    if (menu->cd_player->disc_present && menu->cd_player->is_audio_cd) {
+                        cd_get_disc_info(menu->cd_player);
+
+                        // Validate current audio device
+                        if (audio_validate_device(menu->audio_player) != 0) {
+                            printf("⚠️  Current audio device not ready, using default...\n");
+                            audio_set_device(menu->audio_player, "hw:0,0");
+                            strcpy(menu->current_audio_device, "hw:0,0");
+                            menu->use_bluetooth = false;
+                        }
+
+                        // Ensure CD player reference is set
+                        audio_set_cd_player(menu->audio_player, menu->cd_player);
+
+                        printf("🎵 Starting CD playback on device: %s\n", menu->current_audio_device);
+
                         menu->current_menu = MENU_PLAYBACK;
                         menu->playback_state = PLAYBACK_PLAYING;
-                        audio_play_track(menu->audio_player, menu->current_track);
+
+                        if (audio_play_track(menu->audio_player, menu->current_track) == 0) {
+                            printf("✅ CD playback started on selected device\n");
+                        } else {
+                            printf("❌ Failed to start CD playback\n");
+                            menu->playback_state = PLAYBACK_STOPPED;
+                        }
+
                         menu_update_display(menu);
+                    } else {
+                        lcd_print(menu->lcd, 1, 0, menu->cd_player->disc_present ? "Not audio CD" : "No disc");
                     }
                     break;
                 case 1: // Audio Output
@@ -466,30 +514,42 @@ static void menu_handle_audio_output(menu_system_t *menu, button_event_t event) 
     switch (event) {
         case BUTTON_PREV:
             menu->menu_selection = (menu->menu_selection - 1 + menu->max_selections) % menu->max_selections;
+            printf("🔼 Audio menu: selected item %d\n", menu->menu_selection);
             menu_update_display(menu);
             break;
             
         case BUTTON_NEXT:
             menu->menu_selection = (menu->menu_selection + 1) % menu->max_selections;
+            printf("🔽 Audio menu: selected item %d\n", menu->menu_selection);
             menu_update_display(menu);
             break;
             
         case BUTTON_PLAY_PAUSE:
+            printf("▶️ Audio menu: action on item %d\n", menu->menu_selection);
             switch (menu->menu_selection) {
                 case 0: // Select Device
                     if (menu->num_audio_devices > 0) {
+                        printf("📱 Entering device list (%d devices available)\n", menu->num_audio_devices);
                         menu->current_menu = MENU_AUDIO_DEVICE_LIST;
                         menu->menu_selection = 0;
                         menu->max_selections = menu->num_audio_devices;
                         menu_update_display(menu);
+                    } else {
+                        lcd_print(menu->lcd, 1, 0, "No devices");
+                        printf("❌ No audio devices available\n");
                     }
                     break;
                 case 1: // Refresh List
                     lcd_print(menu->lcd, 1, 0, "Refreshing...");
+                    printf("🔄 Refreshing audio device list...\n");
                     menu_scan_audio_devices(menu);
+                    printf("✅ Found %d audio devices after refresh\n", menu->num_audio_devices);
                     lcd_print(menu->lcd, 1, 0, "List Updated");
+                    usleep(1000000); // Show message for 1 second
+                    menu_update_display(menu);
                     break;
                 case 2: // Back
+                    printf("🔙 Returning to main menu\n");
                     menu->current_menu = MENU_MAIN;
                     menu->menu_selection = 0;
                     menu->max_selections = 5;
@@ -498,36 +558,88 @@ static void menu_handle_audio_output(menu_system_t *menu, button_event_t event) 
             }
             break;
             
+        case BUTTON_NONE:
+            break;
+            
         default:
             break;
     }
 }
 
+
 static void menu_handle_audio_device_list(menu_system_t *menu, button_event_t event) {
     switch (event) {
         case BUTTON_PREV:
             menu->menu_selection = (menu->menu_selection - 1 + menu->max_selections) % menu->max_selections;
+            printf("🔼 Device list: selected device %d\n", menu->menu_selection);
             menu_update_display(menu);
             break;
             
         case BUTTON_NEXT:
             menu->menu_selection = (menu->menu_selection + 1) % menu->max_selections;
+            printf("🔽 Device list: selected device %d\n", menu->menu_selection);
             menu_update_display(menu);
             break;
             
         case BUTTON_PLAY_PAUSE:
-            if (menu->num_audio_devices > 0) {
-                // Select the current audio device
+            if (menu->num_audio_devices > 0 && menu->menu_selection < menu->num_audio_devices) {
                 audio_device_info_t *device = &menu->audio_devices[menu->menu_selection];
+                
                 if (device->is_available) {
-                    audio_set_device(menu->audio_player, device->device_id);
-                    strcpy(menu->current_audio_device, device->device_id);
-                    menu->use_bluetooth = device->is_bluetooth;
+                    printf("🔄 Switching to audio device: %s (%s)\n", device->name, device->device_id);
                     
-                    lcd_print(menu->lcd, 1, 0, "Device Selected");
-                    usleep(1000000); // Show message for 1 second
+                    // Check if it's a Bluetooth device and validate BlueALSA health
+                    if (device->is_bluetooth) {
+                        if (bluetooth_check_bluealsa_health() != 0) {
+                            lcd_print(menu->lcd, 1, 0, "BT Service Error");
+                            printf("❌ BlueALSA service unhealthy, cannot use Bluetooth audio\n");
+                            usleep(2000000);
+                            menu_update_display(menu);
+                            break;
+                        }
+                    }
                     
-                    // Go back to audio output menu
+                    // Stop current playback if active
+                    bool was_playing = (menu->playback_state == PLAYBACK_PLAYING);
+                    int current_track = menu->current_track;
+                    
+                    if (was_playing) {
+                        printf("⏹️ Stopping current playback for device switch\n");
+                        audio_stop(menu->audio_player);
+                        menu->playback_state = PLAYBACK_STOPPED;
+                    }
+                    
+                    // Switch audio device
+                    if (audio_set_device(menu->audio_player, device->device_id) == 0) {
+                        strcpy(menu->current_audio_device, device->device_id);
+                        menu->use_bluetooth = device->is_bluetooth;
+                        
+                        // Ensure CD player reference is maintained
+                        audio_set_cd_player(menu->audio_player, menu->cd_player);
+                        
+                        printf("✅ Audio device switched to: %s\n", device->device_id);
+                        lcd_print(menu->lcd, 1, 0, "Device Selected");
+                        
+                        // If we were playing, restart on new device
+                        if (was_playing) {
+                            printf("🔄 Restarting playback on new device...\n");
+                            usleep(2000000); // 2 second delay for device stabilization
+                            
+                            if (audio_play_track(menu->audio_player, current_track) == 0) {
+                                menu->playback_state = PLAYBACK_PLAYING;
+                                printf("✅ Playback resumed on %s\n", device->name);
+                            } else {
+                                printf("❌ Failed to restart playback on new device\n");
+                            }
+                        }
+                    } else {
+                        lcd_print(menu->lcd, 1, 0, "Switch Failed");
+                        printf("❌ Failed to switch to audio device: %s\n", device->device_id);
+                    }
+                    
+                    usleep(2000000); // Show message for 2 seconds
+                    
+                    // Return to audio output menu
                     menu->current_menu = MENU_AUDIO_OUTPUT;
                     menu->menu_selection = 0;
                     menu->max_selections = 3;
@@ -536,10 +648,15 @@ static void menu_handle_audio_device_list(menu_system_t *menu, button_event_t ev
             }
             break;
             
+        case BUTTON_NONE:
+            break;
+            
         default:
             break;
     }
 }
+
+
 
 static void menu_handle_bluetooth(menu_system_t *menu, button_event_t event) {
     switch (event) {
@@ -580,11 +697,47 @@ static void menu_handle_bluetooth(menu_system_t *menu, button_event_t event) {
                             lcd_print(menu->lcd, 1, 0, "No devices");
                         }
                         break;
-                    case 2: // Disconnect
-                        bluetooth_disconnect_device(menu->bluetooth_manager);
-                        menu_scan_audio_devices(menu); // Refresh audio devices
-                        menu_load_known_bt_devices(menu); // Refresh BT device list
-                        lcd_print(menu->lcd, 1, 0, "Disconnected");
+                        case 2: // Disconnect
+                        printf("🎛️  User selected Disconnect option\n");
+                        
+                        if (menu->bluetooth_manager->is_connected) {
+                            lcd_print(menu->lcd, 1, 0, "Disconnecting...");
+                            
+                            int disconnect_attempts = 0;
+                            int result = -1;
+                            
+                            // Try disconnect up to 2 times before service reset
+                            while (disconnect_attempts < 2 && result != 0) {
+                                result = bluetooth_disconnect_device(menu->bluetooth_manager);
+                                disconnect_attempts++;
+                                
+                                if (result != 0 && disconnect_attempts < 2) {
+                                    printf("⚠️  Disconnect attempt %d failed, retrying...\n", disconnect_attempts);
+                                    sleep(1);
+                                }
+                            }
+                            
+                            if (result == 0) {
+                                menu_scan_audio_devices(menu);
+                                lcd_print(menu->lcd, 1, 0, "Disconnected");
+                            } else {
+                                // Last resort: manual service reset
+                                lcd_print(menu->lcd, 1, 0, "Resetting BT...");
+                                printf("🔄 Manual Bluetooth service reset triggered\n");
+                                
+                                if (bluetooth_reset_service() == 0) {
+                                    // Force state update after reset
+                                    menu->bluetooth_manager->is_connected = false;
+                                    memset(menu->bluetooth_manager->connected_device, 0, 
+                                           sizeof(menu->bluetooth_manager->connected_device));
+                                           menu_load_known_bt_devices(menu);
+                                    menu_scan_audio_devices(menu);
+                                    lcd_print(menu->lcd, 1, 0, "BT Reset Done");
+                                } else {
+                                    lcd_print(menu->lcd, 1, 0, "Reset Failed");
+                                }
+                            }
+                        }
                         break;
                     case 3: // Back
                         menu->current_menu = MENU_MAIN;
@@ -600,8 +753,6 @@ static void menu_handle_bluetooth(menu_system_t *menu, button_event_t event) {
             break;
     }
 }
-
-
 
 static void menu_handle_playback(menu_system_t *menu, button_event_t event) {
     switch (event) {
@@ -678,24 +829,7 @@ void menu_handle_button(menu_system_t *menu, button_event_t event) {
 
 void menu_update_playback_info(menu_system_t *menu) {
     if (menu->playback_state == PLAYBACK_PLAYING) {
-        menu->elapsed_time++;
-        
-        if (menu->track_length == 0) {
-            cd_get_track_info(menu->cd_player, menu->current_track, &menu->track_length);
-        }
-        
-        if (menu->elapsed_time >= menu->track_length && menu->track_length > 0) {
-            if (menu->current_track < menu->cd_player->num_tracks) {
-                menu->current_track++;
-                menu->elapsed_time = 0;
-                menu->track_length = 0;
-                audio_play_track(menu->audio_player, menu->current_track);
-            } else {
-                menu->playback_state = PLAYBACK_STOPPED;
-                audio_stop(menu->audio_player);
-            }
-        }
-        
+        // Force display update even if audio thread isn't updating properly
         if (menu->current_menu == MENU_PLAYBACK) {
             menu_update_display(menu);
         }

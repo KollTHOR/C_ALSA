@@ -1,59 +1,54 @@
 #include "bluetooth_manager.h"
+#include "audio_playback.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
-#include <sys/wait.h>
-#include <fcntl.h>
-#include <time.h> 
+#include <glib.h>
+#include <gio/gio.h>
+#include <time.h>
+
 
 int bluetooth_init(bluetooth_manager_t *manager) {
-    memset(manager, 0, sizeof(bluetooth_manager_t));
-    manager->is_connected = false;
-    manager->num_devices = 0;
-    return 0;
-}
-
-static int get_device_info(const char *mac_address, char *name, size_t name_size, 
-                          bool *is_paired, bool *is_connected) {
-    char command[256];
-    snprintf(command, sizeof(command), "bluetoothctl info %s", mac_address);
+    GError *error = NULL;
     
-    FILE *fp = popen(command, "r");
-    if (!fp) return -1;
-    
-    char line[256];
-    strcpy(name, "Unknown");
-    *is_paired = false;
-    *is_connected = false;
-    
-    while (fgets(line, sizeof(line), fp)) {
-        if (strncmp(line, "\tName: ", 7) == 0) {
-            char *name_start = line + 7;
-            char *newline = strchr(name_start, '\n');
-            if (newline) *newline = '\0';
-            snprintf(name, name_size, "%s", name_start);
-            name[name_size - 1] = '\0';
-        } else if (strncmp(line, "\tPaired: yes", 12) == 0) {
-            *is_paired = true;
-        } else if (strncmp(line, "\tConnected: yes", 15) == 0) {
-            *is_connected = true;
+    // Try to connect to D-Bus
+    manager->connection = g_bus_get_sync(G_BUS_TYPE_SYSTEM, NULL, &error);
+    if (error) {
+        printf("❌ Failed to connect to D-Bus, attempting Bluetooth service reset...\n");
+        g_error_free(error);
+        
+        // Reset service and retry
+        if (bluetooth_reset_service() == 0) {
+            printf("🔄 Retrying D-Bus connection after service reset...\n");
+            manager->connection = g_bus_get_sync(G_BUS_TYPE_SYSTEM, NULL, &error);
+            if (error) {
+                g_error_free(error);
+                return -1;
+            }
+        } else {
+            return -1;
         }
     }
     
-    pclose(fp);
+    // Create object manager for BlueZ
+    manager->object_manager = g_dbus_object_manager_client_new_for_bus_sync(
+        G_BUS_TYPE_SYSTEM,
+        G_DBUS_OBJECT_MANAGER_CLIENT_FLAGS_NONE,
+        "org.bluez",
+        "/",
+        NULL, NULL, NULL, NULL,
+        &error
+    );
+    
+    if (error) {
+        g_error_free(error);
+        return -1;
+    }
+    
     return 0;
 }
 
-static void generate_device_name(const char *mac_address, char *name, size_t name_size) {
-    // Generate friendly name from MAC address (last 4 chars)
-    const char *mac_clean = strrchr(mac_address, ':');
-    if (mac_clean && strlen(mac_clean) > 3) {
-        snprintf(name, name_size, "Device-%s", mac_clean + 1);
-    } else {
-        snprintf(name, name_size, "Device-%04X", (unsigned int)(time(NULL) & 0xFFFF));
-    }
-}
 
 int bluetooth_scan_devices(bluetooth_manager_t *manager) {
     manager->num_devices = 0;
@@ -61,308 +56,616 @@ int bluetooth_scan_devices(bluetooth_manager_t *manager) {
     
     printf("🔍 Scanning for Bluetooth devices...\n");
     
-    // Create pipes for bluetoothctl communication
-    int stdin_pipe[2], stdout_pipe[2];
-    if (pipe(stdin_pipe) == -1 || pipe(stdout_pipe) == -1) {
-        manager->is_scanning = false;
-        return -1;
-    }
+    GList *objects = g_dbus_object_manager_get_objects(manager->object_manager);
     
-    pid_t pid = fork();
-    if (pid == 0) {
-        // Child process: bluetoothctl
-        close(stdin_pipe[1]);   // Close write end
-        close(stdout_pipe[0]);  // Close read end
+    for (GList *l = objects; l != NULL; l = l->next) {
+        GDBusObject *object = G_DBUS_OBJECT(l->data);
+        const char *object_path = g_dbus_object_get_object_path(object);
         
-        dup2(stdin_pipe[0], STDIN_FILENO);
-        dup2(stdout_pipe[1], STDOUT_FILENO);
-        dup2(stdout_pipe[1], STDERR_FILENO);
-        
-        execl("/usr/bin/bluetoothctl", "bluetoothctl", NULL);
-        exit(1);
-    } else if (pid > 0) {
-        // Parent process
-        close(stdin_pipe[0]);   // Close read end
-        close(stdout_pipe[1]);  // Close write end
-        
-        FILE *bt_stdin = fdopen(stdin_pipe[1], "w");
-        FILE *bt_stdout = fdopen(stdout_pipe[0], "r");
-        
-        if (!bt_stdin || !bt_stdout) {
-            manager->is_scanning = false;
-            return -1;
-        }
-        
-        // Start scanning
-        fprintf(bt_stdin, "scan on\n");
-        fflush(bt_stdin);
-        
-        // Extended scanning time (8 seconds like Python version)
-        printf("Scanning for 8 seconds...\n");
-        sleep(8);
-        
-        // Query devices multiple times
-        for (int round = 0; round < 2; round++) {
-            fprintf(bt_stdin, "devices\n");
-            fflush(bt_stdin);
-            sleep(1);
+        // Check if this is a device object
+        if (strstr(object_path, "/dev_")) {
+            GDBusInterface *device_interface = 
+                g_dbus_object_get_interface(object, "org.bluez.Device1");
             
-            fprintf(bt_stdin, "paired-devices\n");
-            fflush(bt_stdin);
-            sleep(1);
-        }
-        
-        // Stop scanning and quit
-        fprintf(bt_stdin, "scan off\n");
-        fprintf(bt_stdin, "quit\n");
-        fflush(bt_stdin);
-        
-        // Read and parse output
-        char line[512];
-        char all_devices[MAX_DEVICES][18]; // Store MAC addresses to avoid duplicates
-        int device_count = 0;
-        
-        while (fgets(line, sizeof(line), bt_stdout) && device_count < MAX_DEVICES) {
-            if (strncmp(line, "Device ", 7) == 0) {
-                char mac[18];
-                char raw_name[256];
+            if (device_interface && manager->num_devices < MAX_DEVICES) {
+                GVariant *address_variant = g_dbus_proxy_get_cached_property(
+                    G_DBUS_PROXY(device_interface), "Address");
+                GVariant *name_variant = g_dbus_proxy_get_cached_property(
+                    G_DBUS_PROXY(device_interface), "Name");
+                GVariant *paired_variant = g_dbus_proxy_get_cached_property(
+                    G_DBUS_PROXY(device_interface), "Paired");
+                GVariant *connected_variant = g_dbus_proxy_get_cached_property(
+                    G_DBUS_PROXY(device_interface), "Connected");
                 
-                if (sscanf(line, "Device %17s %255[^\n]", mac, raw_name) >= 1) {
-                    // Check for duplicates
-                    bool duplicate = false;
-                    for (int i = 0; i < device_count; i++) {
-                        if (strcmp(all_devices[i], mac) == 0) {
-                            duplicate = true;
-                            break;
-                        }
-                    }
+                if (address_variant) {
+                    const char *address = g_variant_get_string(address_variant, NULL);
+                    const char *name = name_variant ? 
+                        g_variant_get_string(name_variant, NULL) : "Unknown Device";
+                    gboolean is_paired = paired_variant ? 
+                        g_variant_get_boolean(paired_variant) : FALSE;
+                    gboolean is_connected = connected_variant ? 
+                        g_variant_get_boolean(connected_variant) : FALSE;
                     
-                    if (!duplicate && manager->num_devices < MAX_DEVICES) {
-                        strcpy(all_devices[device_count], mac);
-                        strcpy(manager->devices[manager->num_devices].address, mac);
-                        
-                        // Get detailed device info
-                        char device_name[MAX_DEVICE_NAME];
-                        bool is_paired = false, is_connected = false;
-                        
-                        // Try to get proper device name and status
-                        if (get_device_info(mac, device_name, sizeof(device_name), 
-                                          &is_paired, &is_connected) == 0 && 
-                            strcmp(device_name, "Unknown") != 0 && strlen(device_name) > 0) {
-                            // Use the detailed device name
-                            strcpy(manager->devices[manager->num_devices].name, device_name);
-                        } else if (sscanf(line, "Device %17s %255[^\n]", mac, raw_name) == 2 && 
-                                  strlen(raw_name) > 0 && strcmp(raw_name, "Unknown Device") != 0) {
-                            // Use the raw name from bluetoothctl output
-                            strcpy(manager->devices[manager->num_devices].name, raw_name);
-                        } else {
-                            // Generate a friendly name from MAC address
-                            generate_device_name(mac, device_name, sizeof(device_name));
-                            strcpy(manager->devices[manager->num_devices].name, device_name);
-                        }
-                        
-                        // Store device status
-                        manager->devices[manager->num_devices].is_paired = is_paired;
-                        manager->devices[manager->num_devices].is_connected = is_connected;
-                        manager->devices[manager->num_devices].is_audio_device = true; // Assume all are audio capable
-                        
-                        printf("Found: %s %s (%s%s)\n", 
-                               manager->devices[manager->num_devices].name,
-                               mac,
-                               is_connected ? "●" : (is_paired ? "○" : "◦"),
-                               is_connected ? " Connected" : (is_paired ? " Paired" : " New"));
-                        
-                        manager->num_devices++;
-                        device_count++;
-                    }
+                    strcpy(manager->devices[manager->num_devices].address, address);
+                    strcpy(manager->devices[manager->num_devices].name, name);
+                    manager->devices[manager->num_devices].is_paired = is_paired;
+                    manager->devices[manager->num_devices].is_connected = is_connected;
+                    manager->devices[manager->num_devices].is_audio_device = true;
+                    
+                    printf("Found: %s %s (%s%s)\n", 
+                           name, address,
+                           is_connected ? "●" : (is_paired ? "○" : "◦"),
+                           is_connected ? " Connected" : (is_paired ? " Paired" : " New"));
+                    
+                    manager->num_devices++;
                 }
+                
+                g_object_unref(device_interface);
             }
         }
-        
-        fclose(bt_stdin);
-        fclose(bt_stdout);
-        
-        // Wait for child process
-        int status;
-        waitpid(pid, &status, 0);
     }
     
+    g_list_free_full(objects, g_object_unref);
     manager->is_scanning = false;
+    
     printf("📱 Found %d Bluetooth devices\n", manager->num_devices);
     return manager->num_devices;
 }
 
-
-int bluetooth_pair_device(bluetooth_manager_t *manager, const char *device_address) {
-    char command[256];
-    snprintf(command, sizeof(command), "bluetoothctl pair %s", device_address);
-    
-    printf("📱 Pairing with %s\n", device_address);
-    
-    int result = system(command);
-    if (result == 0) {
-        printf("✅ Successfully paired with %s\n", device_address);
-        
-        // Auto-connect after successful pairing
-        printf("🔗 Auto-connecting...\n");
-        sleep(1);
-        if (bluetooth_connect_device(manager, device_address) == 0) {
-            printf("✅ Paired and connected successfully\n");
-        }
-        return 0;
-    } else {
-        printf("❌ Failed to pair with %s\n", device_address);
-        return -1;
-    }
-}
-
-int bluetooth_connect_device(bluetooth_manager_t *manager, const char *device_address) {
-    char command[256];
-    snprintf(command, sizeof(command), "bluetoothctl connect %s", device_address);
-    
-    printf("📱 Connecting to %s\n", device_address);
-    
-    int result = system(command);
-    if (result == 0) {
-        printf("✅ Successfully connected to %s\n", device_address);
-        strncpy(manager->connected_device, device_address, sizeof(manager->connected_device) - 1);
-        manager->is_connected = true;
-        return 0;
-    } else {
-        printf("❌ Failed to connect to %s\n", device_address);
-        return -1;
-    }
-}
-
-int bluetooth_disconnect_device(bluetooth_manager_t *manager) {
-    if (!manager->is_connected) {
-        return 0;
-    }
-    
-    char command[256];
-    snprintf(command, sizeof(command), "bluetoothctl disconnect %s", manager->connected_device);
-    
-    printf("📱 Disconnecting from %s\n", manager->connected_device);
-    
-    int result = system(command);
-    if (result == 0) {
-        printf("✅ Successfully disconnected\n");
-        manager->is_connected = false;
-        memset(manager->connected_device, 0, sizeof(manager->connected_device));
-        return 0;
-    } else {
-        printf("❌ Failed to disconnect\n");
-        return -1;
-    }
-}
-
-int bluetooth_get_audio_device_name(bluetooth_manager_t *manager, char *device_name, size_t size) {
-    if (!manager->is_connected) {
-        return -1;
-    }
-    
-    snprintf(device_name, size, "bluealsa");
-    return 0;
-}
-
-int bluetooth_load_paired_devices(bluetooth_manager_t *manager) {
-    manager->num_devices = 0;
-    
-    printf("Loading paired and connected Bluetooth devices...\n");
-    
-    // Create pipes for bluetoothctl communication
-    int stdin_pipe[2], stdout_pipe[2];
-    if (pipe(stdin_pipe) == -1 || pipe(stdout_pipe) == -1) {
-        return -1;
-    }
-    
-    pid_t pid = fork();
-    if (pid == 0) {
-        // Child process: bluetoothctl
-        close(stdin_pipe[1]);
-        close(stdout_pipe[0]);
-        
-        dup2(stdin_pipe[0], STDIN_FILENO);
-        dup2(stdout_pipe[1], STDOUT_FILENO);
-        dup2(stdout_pipe[1], STDERR_FILENO);
-        
-        execl("/usr/bin/bluetoothctl", "bluetoothctl", NULL);
-        exit(1);
-    } else if (pid > 0) {
-        // Parent process
-        close(stdin_pipe[0]);
-        close(stdout_pipe[1]);
-        
-        FILE *bt_stdin = fdopen(stdin_pipe[1], "w");
-        FILE *bt_stdout = fdopen(stdout_pipe[0], "r");
-        
-        if (!bt_stdin || !bt_stdout) {
-            return -1;
-        }
-        
-        // Send commands to get devices
-        fprintf(bt_stdin, "devices\n");
-        fflush(bt_stdin);
-        sleep(1);
-        
-        fprintf(bt_stdin, "quit\n");
-        fflush(bt_stdin);
-        
-        // Read and parse output
-        char line[256];
-        while (fgets(line, sizeof(line), bt_stdout) && manager->num_devices < MAX_DEVICES) {
-            if (strncmp(line, "Device ", 7) == 0) {
-                char mac[18], name[128];
-                if (sscanf(line, "Device %17s %127[^\n]", mac, name) == 2) {
-                    // Check if device is paired
-                    char cmd[256];
-                    snprintf(cmd, sizeof(cmd), "bluetoothctl info %s | grep -q 'Paired: yes'", mac);
-                    if (system(cmd) == 0) {
-                        // Store paired device
-                        strcpy(manager->devices[manager->num_devices].address, mac);
-                        strcpy(manager->devices[manager->num_devices].name, name);
-                        manager->devices[manager->num_devices].is_paired = true;
-                        
-                        // Check connection status
-                        snprintf(cmd, sizeof(cmd), "bluetoothctl info %s | grep -q 'Connected: yes'", mac);
-                        manager->devices[manager->num_devices].is_connected = (system(cmd) == 0);
-                        
-                        manager->devices[manager->num_devices].is_audio_device = true;
-                        manager->num_devices++;
-                        
-                        printf("Found paired device: %s (%s)\n", name, mac);
-                    }
-                }
-            }
-        }
-        
-        fclose(bt_stdin);
-        fclose(bt_stdout);
-        
-        int status;
-        waitpid(pid, &status, 0);
-    }
-    
-    printf("Loaded %d paired/connected devices\n", manager->num_devices);
-    return manager->num_devices;
-}
-
-
 int bluetooth_refresh_device_status(bluetooth_manager_t *manager) {
     // Update connection status for all known devices
     for (int i = 0; i < manager->num_devices; i++) {
-        char cmd[256];
-        snprintf(cmd, sizeof(cmd), "bluetoothctl info %s | grep -q 'Connected: yes'", 
+        char object_path[256];
+        snprintf(object_path, sizeof(object_path), "/org/bluez/hci0/dev_%s", 
                  manager->devices[i].address);
-        manager->devices[i].is_connected = (system(cmd) == 0);
+        
+        // Replace colons with underscores in path
+        for (int j = 0; object_path[j]; j++) {
+            if (object_path[j] == ':') object_path[j] = '_';
+        }
+        
+        GError *error = NULL;
+        GDBusProxy *device_proxy = g_dbus_proxy_new_for_bus_sync(
+            G_BUS_TYPE_SYSTEM,
+            G_DBUS_PROXY_FLAGS_NONE,
+            NULL,
+            "org.bluez",
+            object_path,
+            "org.bluez.Device1",
+            NULL,
+            &error
+        );
+        
+        if (!error && device_proxy) {
+            GVariant *connected_variant = g_dbus_proxy_get_cached_property(
+                device_proxy, "Connected");
+            if (connected_variant) {
+                manager->devices[i].is_connected = g_variant_get_boolean(connected_variant);
+                g_variant_unref(connected_variant);
+            }
+            g_object_unref(device_proxy);
+        } else if (error) {
+            g_error_free(error);
+        }
     }
+    
     return 0;
 }
+
+int bluetooth_disconnect_device(bluetooth_manager_t *manager) {
+    printf("🔌 Attempting to disconnect Bluetooth device...\n");
+    
+    if (!manager->is_connected) {
+        printf("⚠️  No device currently connected\n");
+        return 0;
+    }
+    
+    printf("📱 Disconnecting from device: %s\n", manager->connected_device);
+    
+    // First, try to check if device is actually connected
+    char object_path[256];
+    snprintf(object_path, sizeof(object_path), "/org/bluez/hci0/dev_%s", 
+             manager->connected_device);
+    
+    // Replace colons with underscores in path
+    for (int i = 0; object_path[i]; i++) {
+        if (object_path[i] == ':') object_path[i] = '_';
+    }
+    
+    printf("🔗 Using D-Bus object path: %s\n", object_path);
+    
+    GError *error = NULL;
+    GDBusProxy *device_proxy = g_dbus_proxy_new_for_bus_sync(
+        G_BUS_TYPE_SYSTEM,
+        G_DBUS_PROXY_FLAGS_NONE,
+        NULL,
+        "org.bluez",
+        object_path,
+        "org.bluez.Device1",
+        NULL,
+        &error
+    );
+    
+    if (error) {
+        printf("❌ Failed to create D-Bus proxy: %s\n", error->message);
+        g_error_free(error);
+        return -1;
+    }
+    
+    if (!device_proxy) {
+        printf("❌ Failed to create device proxy (NULL returned)\n");
+        return -1;
+    }
+    
+    // Check current connection status before attempting disconnect
+    GVariant *connected_variant = g_dbus_proxy_get_cached_property(device_proxy, "Connected");
+    if (connected_variant) {
+        gboolean is_connected = g_variant_get_boolean(connected_variant);
+        printf("📊 Device connection status: %s\n", is_connected ? "Connected" : "Disconnected");
+        
+        if (!is_connected) {
+            printf("✅ Device already disconnected\n");
+            g_variant_unref(connected_variant);
+            g_object_unref(device_proxy);
+            
+            // Update manager state
+            manager->is_connected = false;
+            memset(manager->connected_device, 0, sizeof(manager->connected_device));
+            return 0;
+        }
+        g_variant_unref(connected_variant);
+    }
+    
+    printf("🔄 Calling Disconnect method via D-Bus...\n");
+    
+    // Use shorter timeout and add cancellation support
+    GVariant *result = g_dbus_proxy_call_sync(
+        device_proxy,
+        "Disconnect",
+        NULL,
+        G_DBUS_CALL_FLAGS_NONE,
+        2000,  // Reduced timeout to 2 seconds
+        NULL,
+        &error
+    );
+    
+    if (error) {
+        printf("❌ D-Bus Disconnect method failed: %s\n", error->message);
+        
+        if (strstr(error->message, "Timeout") || strstr(error->message, "timeout")) {
+            printf("⏰ Timeout detected, trying fallback methods...\n");
+            g_error_free(error);
+            g_object_unref(device_proxy);
+            
+            // Step 1: Try bluetoothctl fallback
+            printf("🔄 Attempting bluetoothctl fallback...\n");
+            int fallback_result = bluetooth_disconnect_fallback(manager);
+            
+            if (fallback_result == 0) {
+                printf("✅ Fallback disconnect succeeded\n");
+                return 0;
+            }
+            
+            // Step 2: If fallback also fails, reset Bluetooth service
+            printf("❌ Fallback disconnect failed, resetting Bluetooth service...\n");
+            if (bluetooth_reset_service() == 0) {
+                printf("✅ Bluetooth service reset completed\n");
+                
+                // Force update manager state after reset
+                manager->is_connected = false;
+                memset(manager->connected_device, 0, sizeof(manager->connected_device));
+                
+                return 0;
+            } else {
+                printf("❌ Bluetooth service reset failed\n");
+                return -1;
+            }
+        }
+        
+        g_error_free(error);
+        g_object_unref(device_proxy);
+        return -1;
+    }
+    
+    if (result) {
+        printf("✅ D-Bus Disconnect method succeeded\n");
+        g_variant_unref(result);
+        
+        // Update manager state
+        manager->is_connected = false;
+        printf("📝 Updated manager state: is_connected = false\n");
+        
+        printf("🧹 Clearing connected device: %s\n", manager->connected_device);
+        memset(manager->connected_device, 0, sizeof(manager->connected_device));
+        
+        printf("✅ Successfully disconnected from Bluetooth device\n");
+    } else {
+        printf("⚠️  Disconnect method returned NULL result\n");
+    }
+    
+    g_object_unref(device_proxy);
+    printf("🧹 Cleaned up D-Bus proxy\n");
+    
+    return 0;
+}
+
+int bluetooth_disconnect_fallback(bluetooth_manager_t *manager) {
+    printf("🔄 Using fallback disconnect method with timeout...\n");
+    
+    char command[256];
+    snprintf(command, sizeof(command), "timeout 5 bluetoothctl disconnect %s", manager->connected_device);
+    
+    printf("🖥️  Executing: %s\n", command);
+    
+    int result = system(command);
+    
+    // Check if timeout occurred (exit code 124)
+    if (WEXITSTATUS(result) == 124) {
+        printf("⏰ Bluetoothctl fallback timed out after 5 seconds\n");
+        
+        // Force disconnect using hciconfig
+        printf("🔧 Attempting hardware-level disconnect...\n");
+        char hci_command[256];
+        snprintf(hci_command, sizeof(hci_command), "sudo hciconfig hci0 reset");
+        
+        if (system(hci_command) == 0) {
+            printf("✅ Hardware reset completed\n");
+            
+            // Update manager state after hardware reset
+            manager->is_connected = false;
+            memset(manager->connected_device, 0, sizeof(manager->connected_device));
+            
+            return 0;
+        } else {
+            printf("❌ Hardware reset failed\n");
+            return -1;
+        }
+    } else if (result == 0) {
+        printf("✅ Fallback disconnect succeeded\n");
+        
+        // Update manager state
+        manager->is_connected = false;
+        memset(manager->connected_device, 0, sizeof(manager->connected_device));
+        
+        return 0;
+    } else {
+        printf("❌ Fallback disconnect failed with exit code: %d\n", WEXITSTATUS(result));
+        return -1;
+    }
+}
+
+
+
+
+int bluetooth_reset_service(void) {
+    printf("🔄 Resetting Bluetooth service...\n");
+    
+    // Stop BlueALSA
+    if (system("sudo systemctl stop bluealsa") != 0) {
+        printf("⚠️  Warning: Failed to stop BlueALSA service\n");
+    }
+    sleep(1);
+    
+    // Restart Bluetooth service
+    if (system("sudo systemctl restart bluetooth") != 0) {
+        printf("❌ Failed to restart Bluetooth service\n");
+        return -1;
+    }
+    
+    sleep(2); // Wait for service to start
+    
+    // Restart BlueALSA
+    if (system("sudo systemctl start bluealsa") != 0) {
+        printf("⚠️  Warning: Failed to start BlueALSA service\n");
+    }
+    sleep(1);
+    
+    printf("✅ Bluetooth service reset completed\n");
+    return 0;
+}
+
+int bluetooth_pair_device(bluetooth_manager_t *manager, const char *device_address) {
+    (void)manager;
+    printf("📱 Pairing with device: %s\n", device_address);
+    
+    GError *error = NULL;
+    char object_path[256];
+    
+    // Convert MAC address to D-Bus object path
+    snprintf(object_path, sizeof(object_path), "/org/bluez/hci0/dev_%s", device_address);
+    
+    // Replace colons with underscores in path
+    for (int i = 0; object_path[i]; i++) {
+        if (object_path[i] == ':') object_path[i] = '_';
+    }
+    
+    printf("🔗 Using D-Bus object path: %s\n", object_path);
+    
+    // Create D-Bus proxy for the device
+    GDBusProxy *device_proxy = g_dbus_proxy_new_for_bus_sync(
+        G_BUS_TYPE_SYSTEM,
+        G_DBUS_PROXY_FLAGS_NONE,
+        NULL,
+        "org.bluez",
+        object_path,
+        "org.bluez.Device1",
+        NULL,
+        &error
+    );
+    
+    if (error) {
+        printf("❌ Failed to create D-Bus proxy: %s\n", error->message);
+        g_error_free(error);
+        return -1;
+    }
+    
+    if (!device_proxy) {
+        printf("❌ Failed to create device proxy (NULL returned)\n");
+        return -1;
+    }
+    
+    printf("🔄 Calling Pair method via D-Bus...\n");
+    
+    // Call the Pair method
+    GVariant *result = g_dbus_proxy_call_sync(
+        device_proxy,
+        "Pair",
+        NULL,
+        G_DBUS_CALL_FLAGS_NONE,
+        30000,  // 30 second timeout for pairing
+        NULL,
+        &error
+    );
+    
+    if (error) {
+        printf("❌ D-Bus Pair method failed: %s\n", error->message);
+        g_error_free(error);
+        g_object_unref(device_proxy);
+        return -1;
+    }
+    
+    if (result) {
+        printf("✅ D-Bus Pair method succeeded\n");
+        g_variant_unref(result);
+        
+        printf("✅ Successfully paired with device: %s\n", device_address);
+    } else {
+        printf("⚠️  Pair method returned NULL result\n");
+    }
+    
+    g_object_unref(device_proxy);
+    printf("🧹 Cleaned up D-Bus proxy\n");
+    
+    return 0;
+}
+
+
+int bluetooth_check_connection_status(bluetooth_manager_t *manager, const char *device_address) {
+    (void)manager; 
+    char object_path[256];
+    snprintf(object_path, sizeof(object_path), "/org/bluez/hci0/dev_%s", device_address);
+    
+    // Replace colons with underscores in path
+    for (int i = 0; object_path[i]; i++) {
+        if (object_path[i] == ':') object_path[i] = '_';
+    }
+    
+    GError *error = NULL;
+    GDBusProxy *device_proxy = g_dbus_proxy_new_for_bus_sync(
+        G_BUS_TYPE_SYSTEM,
+        G_DBUS_PROXY_FLAGS_NONE,
+        NULL,
+        "org.bluez",
+        object_path,
+        "org.bluez.Device1",
+        NULL,
+        &error
+    );
+    
+    if (error || !device_proxy) {
+        if (error) g_error_free(error);
+        return -1;
+    }
+    
+    GVariant *connected_variant = g_dbus_proxy_get_cached_property(device_proxy, "Connected");
+    GVariant *name_variant = g_dbus_proxy_get_cached_property(device_proxy, "Name");
+    
+    if (connected_variant && name_variant) {
+        gboolean is_connected = g_variant_get_boolean(connected_variant);
+        const char *name = g_variant_get_string(name_variant, NULL);
+        
+        printf("📊 Device Status: %s (%s) - %s\n", 
+               name, device_address, 
+               is_connected ? "Connected" : "Disconnected");
+        
+        g_variant_unref(connected_variant);
+        g_variant_unref(name_variant);
+    }
+    
+    g_object_unref(device_proxy);
+    return 0;
+}
+
 
 
 void bluetooth_cleanup(bluetooth_manager_t *manager) {
     if (manager->is_connected) {
         bluetooth_disconnect_device(manager);
     }
+    
+    if (manager->object_manager) {
+        g_object_unref(manager->object_manager);
+        manager->object_manager = NULL;
+    }
+    
+    if (manager->connection) {
+        g_object_unref(manager->connection);
+        manager->connection = NULL;
+    }
+    
     memset(manager, 0, sizeof(bluetooth_manager_t));
+}
+
+
+int bluetooth_load_paired_devices(bluetooth_manager_t *manager) {
+    manager->num_devices = 0;
+    
+    GList *objects = g_dbus_object_manager_get_objects(manager->object_manager);
+    
+    for (GList *l = objects; l != NULL; l = l->next) {
+        GDBusObject *object = G_DBUS_OBJECT(l->data);
+        const char *object_path = g_dbus_object_get_object_path(object);
+        
+        // Check if this is a device object
+        if (strstr(object_path, "/dev_")) {
+            GDBusInterface *device_interface = 
+                g_dbus_object_get_interface(object, "org.bluez.Device1");
+            
+            if (device_interface) {
+                GVariant *address_variant = g_dbus_proxy_get_cached_property(
+                    G_DBUS_PROXY(device_interface), "Address");
+                GVariant *name_variant = g_dbus_proxy_get_cached_property(
+                    G_DBUS_PROXY(device_interface), "Name");
+                GVariant *paired_variant = g_dbus_proxy_get_cached_property(
+                    G_DBUS_PROXY(device_interface), "Paired");
+                GVariant *connected_variant = g_dbus_proxy_get_cached_property(
+                    G_DBUS_PROXY(device_interface), "Connected");
+                
+                if (address_variant && paired_variant) {
+                    gboolean is_paired = g_variant_get_boolean(paired_variant);
+                    
+                    if (is_paired && manager->num_devices < MAX_DEVICES) {
+                        const char *address = g_variant_get_string(address_variant, NULL);
+                        const char *name = name_variant ? 
+                            g_variant_get_string(name_variant, NULL) : "Unknown";
+                        gboolean is_connected = connected_variant ? 
+                            g_variant_get_boolean(connected_variant) : FALSE;
+                        
+                        strcpy(manager->devices[manager->num_devices].address, address);
+                        strcpy(manager->devices[manager->num_devices].name, name);
+                        manager->devices[manager->num_devices].is_paired = TRUE;
+                        manager->devices[manager->num_devices].is_connected = is_connected;
+                        manager->devices[manager->num_devices].is_audio_device = TRUE;
+                        
+                        manager->num_devices++;
+                    }
+                }
+                
+                g_object_unref(device_interface);
+            }
+        }
+    }
+    
+    g_list_free_full(objects, g_object_unref);
+    return manager->num_devices;
+}
+
+
+
+int bluetooth_check_bluealsa_health(void) {
+    printf("🔍 Checking BlueALSA service health...\n");
+    
+    // Check if BlueALSA process is running
+    if (system("pgrep bluealsa > /dev/null 2>&1") != 0) {
+        printf("❌ BlueALSA service not running\n");
+        return -1;
+    }
+    
+    // Check if BlueALSA is responsive
+    if (system("timeout 3 bluealsa-aplay -l > /dev/null 2>&1") != 0) {
+        printf("❌ BlueALSA service not responsive\n");
+        
+        // Try to restart BlueALSA
+        printf("🔄 Restarting BlueALSA service...\n");
+        if (system("sudo systemctl restart bluealsa") != 0) {
+            printf("⚠️  Warning: Failed to restart BlueALSA service\n");
+        }
+        sleep(2);
+        
+        if (system("pgrep bluealsa > /dev/null 2>&1") == 0) {
+            printf("✅ BlueALSA service restarted\n");
+            return 0;
+        } else {
+            printf("❌ Failed to restart BlueALSA service\n");
+            return -1;
+        }
+    }
+    
+    printf("✅ BlueALSA service is healthy\n");
+    return 0;
+}
+
+int bluetooth_connect_device(bluetooth_manager_t *manager, const char *device_address) {
+    printf("📱 Connecting to %s\n", device_address);
+    
+    char object_path[256];
+    snprintf(object_path, sizeof(object_path), "/org/bluez/hci0/dev_%s", device_address);
+    
+    // Replace colons with underscores in path
+    for (int i = 0; object_path[i]; i++) {
+        if (object_path[i] == ':') object_path[i] = '_';
+    }
+    
+    printf("🔗 Using D-Bus object path: %s\n", object_path);
+    
+    GError *error = NULL;
+    GDBusProxy *device_proxy = g_dbus_proxy_new_for_bus_sync(
+        G_BUS_TYPE_SYSTEM,
+        G_DBUS_PROXY_FLAGS_NONE,
+        NULL,
+        "org.bluez",
+        object_path,
+        "org.bluez.Device1",
+        NULL,
+        &error
+    );
+    
+    if (error) {
+        printf("❌ Failed to create D-Bus proxy: %s\n", error->message);
+        g_error_free(error);
+        return -1;
+    }
+    
+    printf("🔄 Calling Connect method via D-Bus...\n");
+    
+    GVariant *result = g_dbus_proxy_call_sync(
+        device_proxy,
+        "Connect",
+        NULL,
+        G_DBUS_CALL_FLAGS_NONE,
+        10000,  // 10 second timeout for connection
+        NULL,
+        &error
+    );
+    
+    if (error) {
+        printf("❌ D-Bus Connect method failed: %s\n", error->message);
+        g_error_free(error);
+        g_object_unref(device_proxy);
+        return -1;
+    }
+    
+    if (result) {
+        printf("✅ D-Bus Connect method succeeded\n");
+        g_variant_unref(result);
+        
+        // Update manager state
+        strncpy(manager->connected_device, device_address, sizeof(manager->connected_device) - 1);
+        manager->is_connected = true;
+        
+        // Play connection notification
+        char bt_device_id[128];
+        snprintf(bt_device_id, sizeof(bt_device_id), "bluealsa:DEV=%s,PROFILE=a2dp", device_address);
+        
+        // Test and potentially switch to Bluetooth audio
+        printf("🔄 Testing Bluetooth audio device...\n");
+        if (audio_test_device_with_notification(bt_device_id, "./assets/sounds/bt_connect.wav") == 0) {
+            printf("🎉 Bluetooth audio working! Device ready for CD playback\n");
+        }
+        
+        printf("✅ Successfully connected to Bluetooth device\n");
+    }
+    
+    g_object_unref(device_proxy);
+    return 0;
 }
